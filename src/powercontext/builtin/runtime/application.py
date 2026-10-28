@@ -143,6 +143,7 @@ from powercontext.builtin.persistence.artifact_governance import (
     ArtifactGovernance,
     ArtifactLifecycleState,
 )
+from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.skill_publications import SkillPublication
 from powercontext.builtin.publication import ArtifactPublicationApplication
 from powercontext.builtin.records import (
@@ -248,6 +249,7 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -2683,7 +2685,22 @@ class ScopedTopicMemoryApplication:
                         "unit": "topic-memory",
                     },
                 )
-        return result
+        return await self._exclude_withdrawn_topics(result)
+
+    async def _exclude_withdrawn_topics(self, result: TopicMemorySearchResult) -> TopicMemorySearchResult:
+        """Drop the topics whose supporting evidence was withdrawn.
+
+        A withdrawn topic keeps its artifact and its historical revision; it only
+        stops being a candidate for generation until its support comes back.
+        """
+
+        withdrawn = await self._runtime.lifecycle.inactive_topic_ids(self.scope_id)
+        if not withdrawn or not result.hits:
+            return result
+        kept = tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id not in withdrawn)
+        if len(kept) == len(result.hits):
+            return result
+        return result.model_copy(update={"hits": kept})
 
     async def _search_with_embedding(
         self,
@@ -2977,6 +2994,7 @@ class BuiltinRuntime:
         *,
         provider: PowerContextProvider[BuiltinSources, BuiltinArtifacts, BuiltinTriggers],
         capabilities: RuntimeCapabilities,
+        database: AsyncDatabase | None = None,
         code_service: CodeService | None = None,
         source_window_limit: int = 100,
         context_assembly_max_entries: int = 8,
@@ -3101,6 +3119,7 @@ class BuiltinRuntime:
         self._scheduler_runtime_key: str | None = None
         self.sources = SourceApplication(self)
         self.ingestion = RemoteIngestionApplication(self, remote_ingestion)
+        self.lifecycle = SourceLifecycleApplication(self, database)
         self.code = CodeApplication(self, code_service or CodeService(CodeConfig()))
         self.context = ContextApplication(self)
         self.experience = ExperienceApplication(self)
