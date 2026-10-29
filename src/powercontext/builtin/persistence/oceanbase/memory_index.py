@@ -43,6 +43,7 @@ from powercontext.builtin.artifacts.memory import (
 )
 from powercontext.builtin.artifacts.memory.canonical import embedding_content_hash, validate_embedding
 from powercontext.builtin.persistence.memory_index import memory_channel_hits
+from powercontext.builtin.persistence.oceanbase.native_hybrid import native_hybrid_search
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
     MAX_MEMORY_ENTRY_ID_LENGTH,
@@ -154,7 +155,7 @@ class OceanBaseMemoryFTSIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
-        if request.mode not in {"fts", "hybrid"}:
+        if request.mode != "fts":
             return MemorySearchChannels()
         score = match(MEMORY_ENTRY_HEADS_TABLE.c.searchable_text, against=request.analyzed_query)
         rows = (
@@ -377,6 +378,11 @@ class OceanBaseMemoryVectorIndex:
             raise CapabilityNotSupportedError("embedding-profile")
         if not await self.vector_complete(connection, scope_id, request.memories, self.profile):
             raise CapabilityNotSupportedError("vector")
+        if request.mode == "hybrid":
+            # One statement answers both candidate channels natively, so the
+            # application layer fuses the two rankings instead of stitching two
+            # candidate queries together.
+            return await native_hybrid_search(connection, scope_id, request, self.profile)
         rows = (
             await connection.execute(
                 self._search_sql if request.tag_filter is None else self._tagged_search_sql,
