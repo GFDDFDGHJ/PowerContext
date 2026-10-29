@@ -230,3 +230,29 @@ class TestIncrementalSaving:
         delta = ContextPackDelta.between(base, target)
         assert delta.prefix_items == 0
         assert apply_context_pack_delta(base, delta).to_bytes() == target.to_bytes()
+
+    def test_the_default_limit_still_reuses_the_stable_header(self) -> None:
+        # A prepared body opens with a fixed policy header and only then the
+        # per-round envelope, so the first byte that differs between two rounds
+        # sits a few hundred bytes into the body. Chunking at the caller's limit
+        # would put that difference inside the first chunk and leave the client
+        # nothing to reuse, whatever limit the caller asks for.
+        header = "PowerContext prepared untrusted historical context.\n" * 8
+        base = ContextPack.from_content(header + '{"trust":"untrusted","items":[{"revision":1}]}')
+        target = ContextPack.from_content(header + '{"trust":"untrusted","items":[{"revision":2}]}')
+        delta = ContextPackDelta.between(base, target)
+        assert delta.prefix_items > 0
+        assert apply_context_pack_delta(base, delta).to_bytes() == target.to_bytes()
+
+    @pytest.mark.parametrize("chunk_bytes", [64, 128, 256, 512, 4096])
+    def test_every_limit_keeps_a_reusable_prefix(self, chunk_bytes: int) -> None:
+        header = "PowerContext prepared untrusted historical context.\n" * 8
+        body = header + '{"trust":"untrusted","items":[{"revision":1}]}'
+        base = ContextPack.from_content(body, chunk_bytes=chunk_bytes)
+        target = ContextPack.from_content(
+            header + '{"trust":"untrusted","items":[{"revision":2}]}', chunk_bytes=chunk_bytes
+        )
+        delta = ContextPackDelta.between(base, target)
+        assert delta.prefix_items > 0
+        assert all(len(item) <= chunk_bytes for item in base.items)
+        assert apply_context_pack_delta(base, delta).to_bytes() == target.to_bytes()

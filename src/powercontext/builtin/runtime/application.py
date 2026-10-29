@@ -827,9 +827,10 @@ class StatisticsApplication:
 class ScopedContextApplication:
     """Prepare final context for one scope using Runtime-owned source policy."""
 
-    # Incremental transport reuses the leading chunks of the previous pack. A
-    # smaller chunk keeps more of the stable part of the body reusable when the
-    # body changes, and it measured better than the 512-byte default.
+    # Incremental transport reuses the leading chunks of the previous pack. The
+    # packer keeps a chunk boundary inside the stable part of the body so a
+    # changed body still hands over its whole leading prefix; see
+    # ``context_pack.PACKING_GRANULARITY_BYTES``.
     _incremental_chunk_bytes = 128
 
     def __init__(self, runtime: BuiltinRuntime, scope_id: str) -> None:

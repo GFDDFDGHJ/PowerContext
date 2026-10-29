@@ -39,6 +39,14 @@ from powercontext.errors import PowerContextError
 PACK_SCHEMA = "powercontext.context-pack.v1"
 DELTA_SCHEMA = "powercontext.context-pack-delta.v1"
 DEFAULT_CHUNK_BYTES = 512
+# The caller's number is an upper bound on a chunk, not the chunk size. A prepared
+# body opens with a fixed policy header and only then the per-round envelope, and
+# the first bytes that differ between two rounds sit a few hundred bytes into the
+# envelope. Chunking at the caller's limit would swallow that difference inside the
+# first chunk, and a delta could then reuse no prefix at all. Packing at a fixed
+# granularity keeps a boundary inside the stable header instead, so a changed body
+# still hands the receiver its whole leading prefix.
+PACKING_GRANULARITY_BYTES = 128
 
 
 class ContextPackError(PowerContextError, ValueError):
@@ -152,7 +160,8 @@ class ContextPack:
             return cls.build(())
 
         raw = content.encode("utf-8")
-        return cls.build(tuple(_split_bytes(raw, chunk_bytes)))
+        granularity = min(chunk_bytes, PACKING_GRANULARITY_BYTES)
+        return cls.build(tuple(_split_bytes(raw, granularity)))
 
     def to_bytes(self) -> bytes:
         """Serialize the pack into its wire form."""
