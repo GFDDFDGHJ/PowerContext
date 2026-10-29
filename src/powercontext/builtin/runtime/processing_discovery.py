@@ -16,14 +16,52 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
 from powercontext.builtin.persistence.supervision import ArtifactProcessingFence, ArtifactProcessingLeaseRepository
-from powercontext.builtin.persistence.tables import PROFILE_POLICIES_TABLE, SOURCE_JOURNAL_HEADS_TABLE
+from powercontext.builtin.persistence.tables import (
+    PROFILE_POLICIES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+    SOURCES_TABLE,
+)
+
+
+async def pending_source_counts(
+    connection: AsyncConnection,
+    scope_ids: tuple[str, ...],
+    binding_name: str,
+    /,
+) -> dict[str, int]:
+    """Count the Source entries each scope still owes one processing family.
+
+    The count is the number of persisted journal identities after the family's
+    last committed Source cursor, so it counts Source entries rather than body
+    length, token count, or produced artifacts. A scope that never committed a
+    cursor starts from zero. A replayed Source identity keeps its original
+    journal position, so replaying it does not add a pending identity.
+    """
+
+    if not scope_ids:
+        return {}
+    cursors = SourceCursorRepository()
+    counts: dict[str, int] = {}
+    for scope in scope_ids:
+        cursor = await cursors.load(connection, scope, binding_name)
+        committed = 0 if cursor is None else int(cursor.cursor.sequence)
+        statement = (
+            select(func.count())
+            .select_from(SOURCES_TABLE)
+            .where(
+                SOURCES_TABLE.c.scope_id == scope,
+                SOURCES_TABLE.c.journal_position > committed,
+            )
+        )
+        counts[scope] = int((await connection.execute(statement)).scalar_one())
+    return counts
 
 
 async def enabled_profile_scopes(connection: AsyncConnection, scope_ids: tuple[str, ...]) -> frozenset[str]:

@@ -209,6 +209,21 @@ class ArtifactProcessingIntentRepository:
             or 0
         )
 
+    async def has_dirty(self, connection: AsyncConnection, binding_name: str, /) -> bool:
+        """Report whether any scope still owes this binding unprocessed work."""
+
+        _require_identifier("binding_name", binding_name, MAX_BINDING_NAME_LENGTH)
+        table = ARTIFACT_PROCESSING_INTENTS_TABLE
+        statement = (
+            select(table.c.scope_id)
+            .where(
+                table.c.binding_name == binding_name,
+                table.c.dirty_generation > table.c.clean_generation,
+            )
+            .limit(1)
+        )
+        return (await connection.execute(statement)).first() is not None
+
     async def admit(
         self,
         connection: AsyncConnection,

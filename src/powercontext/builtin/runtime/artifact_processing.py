@@ -67,6 +67,7 @@ from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkerOutcome,
     WorkerEntrypoint,
 )
+from powercontext.builtin.runtime.processing_discovery import pending_source_counts
 from powercontext.builtin.runtime.protocols import RuntimeTracing
 
 logger = logging.getLogger(__name__)
@@ -80,9 +81,19 @@ _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
+# A count trigger has no schedule of its own. The supervisor re-checks the
+# waiting counts on this bounded interval instead of on a time schedule.
+_COUNT_TRIGGER_POLL_SECONDS = 0.25
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 ProcessingKey = tuple[str, str]
+
+
+def _require_count_threshold(value: int | None) -> None:
+    """Accept only a strict positive integer count threshold."""
+
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError("count_threshold must be a positive integer")  # noqa: TRY003
 
 
 class ArtifactProcessingSupervisorStatus(StrEnum):
@@ -111,6 +122,9 @@ class ArtifactProcessingBinding:
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
     cron: str | None = None
+    # Count admission: process this family once this many new Source entries are
+    # waiting for it. ``None`` keeps the time-based admission only.
+    count_threshold: int | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
@@ -138,6 +152,7 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+        _require_count_threshold(self.count_threshold)
 
 
 class _WorkerResultSender(Protocol):
@@ -400,6 +415,7 @@ class _FamilyState:
     notification_at_start: int = 0
     discovery_pending: bool = True
     next_schedule_at: float | None = None
+    next_count_check_at: float | None = None
     next_discovery_at: float = 0.0
     automatic_next: bool = False
     overflow_not_before: float = 0.0
@@ -701,7 +717,22 @@ class ArtifactProcessingSupervisor:
     async def _discover_automatic(self, state: _FamilyState) -> None:  # noqa: C901 - bounded admission state
         binding = state.binding
         capacity = self._fresh_capacity(state)
+        if binding.count_threshold is not None:
+            # A count trigger has no schedule, so the supervisor re-checks the
+            # waiting counts on a bounded interval.
+            state.next_count_check_at = asyncio.get_running_loop().time() + _COUNT_TRIGGER_POLL_SECONDS
         if capacity <= 0:
+            return
+        if (
+            binding.count_threshold is not None
+            and not state.scan_in_progress
+            and binding.automatic_processing_interval is None
+            and binding.cron is None
+            and not await self._has_dirty_work(binding.binding_name)
+        ):
+            # No scope owes this Family any work. A count trigger only has to
+            # re-check once a new Source arrives, so an idle binding keeps no
+            # write transaction open between polls.
             return
         # Publish RAM progress only after the transaction commits. Advancing a
         # page cursor before admit/finish/commit succeeds would skip rolled-back
@@ -715,7 +746,14 @@ class ArtifactProcessingSupervisor:
         async with self._database.transaction() as connection:
             await self._leases.require_fence(connection, self._require_current_fence())
             persisted = await self._binding_states.load(connection, binding.binding_name, for_update=True)
-            enabled = binding.automatic_processing_interval is not None or binding.cron is not None
+            # Count admission enables the automatic path on its own: the number of
+            # waiting entries can reach the threshold at any moment, so the scan
+            # cannot wait for a time-based schedule.
+            enabled = (
+                binding.automatic_processing_interval is not None
+                or binding.cron is not None
+                or binding.count_threshold is not None
+            )
             if not enabled:
                 if persisted is not None and persisted.scan_in_progress:
                     await self._binding_states.finish_scan(connection, binding.binding_name)
@@ -723,12 +761,32 @@ class ArtifactProcessingSupervisor:
                 scan_after = 0
             else:
                 now = await database_utc_now(connection)
+                schedule_due = False
+                scheduled = binding.automatic_processing_interval is not None or binding.cron is not None
+                if not scheduled:
+                    # A count trigger has no schedule of its own. Leaving the
+                    # schedule deadline unset keeps an unscheduled binding from
+                    # re-scanning on every supervisor tick.
+                    next_schedule_at = None
                 if persisted is None or not persisted.scan_in_progress:
                     checkpoint = None if persisted is None else persisted.last_schedule_checkpoint_at
                     due, next_time = _schedule_deadline(binding, checkpoint, now)
-                    next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
-                    if due is not None:
+                    if scheduled:
+                        next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
+                    if due is not None and scheduled:
                         persisted = await self._binding_states.start_scan(connection, binding.binding_name, due)
+                        scan_after = 0
+                        schedule_due = True
+                    elif binding.count_threshold is not None:
+                        # A count trigger has no schedule of its own. Start a scan
+                        # so the waiting counts are read, and let the admission
+                        # below decide which scopes reached the threshold. The
+                        # schedule checkpoint is preserved, so re-checking the
+                        # counts never postpones the time condition.
+                        checkpoint_at = None if persisted is None else persisted.last_schedule_checkpoint_at
+                        persisted = await self._binding_states.start_scan(
+                            connection, binding.binding_name, checkpoint_at
+                        )
                         scan_after = 0
                 if persisted is not None and persisted.scan_in_progress:
                     scan_in_progress = True
@@ -754,6 +812,13 @@ class ArtifactProcessingSupervisor:
                     eligible = frozenset(candidates)
                     if candidates and binding.automatic_scope_filter is not None:
                         eligible &= await binding.automatic_scope_filter(connection, candidates)
+                    if candidates and binding.count_threshold is not None and not schedule_due:
+                        # The time condition did not fire, so only the scopes whose
+                        # waiting count reached the threshold may start now.
+                        counts = await pending_source_counts(connection, candidates, binding.binding_name)
+                        eligible &= frozenset(
+                            scope for scope in candidates if counts.get(scope, 0) >= binding.count_threshold
+                        )
                     for row in rows:
                         # A full page of ineligible rows still advances discovery;
                         # keep their dirty Source and request counters untouched.
@@ -770,8 +835,11 @@ class ArtifactProcessingSupervisor:
                         scan_after = 0
                         # Starting a scan established its checkpoint, so a
                         # completed page must not restart the interval here.
-                        _, next_time = _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
-                        next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
+                        if scheduled:
+                            _, next_time = _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
+                            next_schedule_at = asyncio.get_running_loop().time() + max(
+                                0, (next_time - now).total_seconds()
+                            )
                     else:
                         next_discovery_at = asyncio.get_running_loop().time() + _DISCOVERY_PAGE_DELAY_SECONDS
         state.scan_after = scan_after
@@ -787,6 +855,12 @@ class ArtifactProcessingSupervisor:
         return min(
             _DISCOVERY_PAGE_SIZE - len(state.ready), _CHANNEL_QUEUE_LIMIT - (len(state.ready) - len(state.retry_queued))
         )
+
+    async def _has_dirty_work(self, binding_name: str) -> bool:
+        """Read whether any scope still owes this binding unprocessed work."""
+
+        async with self._database.transaction() as connection:
+            return await self._intents.has_dirty(connection, binding_name)
 
     async def _activate_retries(self, state: _FamilyState) -> None:
         now = asyncio.get_running_loop().time()
@@ -1093,6 +1167,8 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.next_count_check_at is not None:
+                deadlines.append(state.next_count_check_at)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
