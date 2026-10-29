@@ -137,6 +137,11 @@ class RuntimeConfig(BaseModel):
 
     scope_cache_size: int = Field(default=DEFAULT_SCOPE_CACHE_SIZE, ge=1)
     source_window_limit: int = Field(default=100, ge=1)
+    # Count admission: process a family once this many new Source entries are
+    # waiting. ``None`` keeps the time-based behaviour and disables the count
+    # trigger for that family.
+    memory_source_count_threshold: int | None = Field(default=None, gt=0)
+    topic_memory_source_count_threshold: int | None = Field(default=None, gt=0)
     context_assembly_max_entries: int = Field(default=8, ge=1)
     memory_extraction_profile: MemoryExtractionProfile = MemoryExtractionProfile.CODING
     memory_rerank_enabled: bool = False
@@ -154,6 +159,21 @@ class RuntimeConfig(BaseModel):
     memory_compaction_enabled: bool = False
     memory_compaction_min_tombstone_revisions: int = Field(default=10, ge=0)
     memory_max_history_revisions: int = Field(default=100, ge=1)
+
+    @field_validator(
+        "memory_source_count_threshold",
+        "topic_memory_source_count_threshold",
+        mode="before",
+    )
+    @classmethod
+    def reject_non_integer_count_threshold(cls, value: Any) -> Any:
+        # A count threshold is a number of Source entries. Booleans, floats and
+        # strings are not counts, and pydantic would otherwise coerce them.
+        if value is None:
+            return value
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("Count threshold must be a positive integer or None")  # noqa: TRY003, TRY004
+        return value
 
     @model_validator(mode="after")
     def validate_memory_capacity_order(self) -> RuntimeConfig:
